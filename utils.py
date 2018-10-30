@@ -121,12 +121,78 @@ def pe(cmd, shell=False):
     for line in execute(cmd, shell=shell):
         print(line, end="")
 
+def run_process(args, shell=True, log=True):
+    #print("DEBUG: ", args)
+
+    logger = logging.getLogger()
+
+    # a convenience function instead of calling subprocess directly
+    # this is so that we can do some logging and catch exceptions
+
+    # we don't always want debug logging, even when logging level is DEBUG
+    # especially if calling a lot of external functions
+    # so we can disable it by force, where necessary
+    if log:
+        logger.info('%s' % args)
+
+    try:
+        # the following is only available in later versions of Python
+        # rval = subprocess.check_output(args)
+
+        # bufsize=-1 enables buffering and may improve performance compared to the unbuffered case
+        p = subprocess.Popen(args, bufsize=-1, shell=shell,
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        close_fds=True, env=os.environ)
+        # better to use communicate() than read() and write() - this avoids deadlocks
+        (stdoutdata, stderrdata) = p.communicate()
+
+        if p.returncode != 0:
+            # for critical things, we always log, even if log==False
+            logger.critical('exit status %d' % p.returncode )
+            logger.critical(' for command: %s' % args )
+            logger.critical('      stderr: %s' % stderrdata )
+            logger.critical('      stdout: %s' % stdoutdata )
+            raise OSError
+
+        return (stdoutdata, stderrdata)
+
+    except subprocess.CalledProcessError as e:
+        # not sure under what circumstances this exception would be raised in Python 2.6
+        logger.critical('exit status %d' % e.returncode )
+        logger.critical(' for command: %s' % args )
+        # not sure if there is an 'output' attribute under 2.6 ? still need to test this...
+        logger.critical('  output: %s' % e.output )
+        raise
+
+    except ValueError:
+        logger.critical('ValueError for %s' % args )
+        raise
+
+    except OSError:
+        logger.critical('OSError for %s' % args )
+        raise
+
+    except KeyboardInterrupt:
+        logger.critical('KeyboardInterrupt during %s' % args )
+        try:
+            # try to kill the subprocess, if it exists
+            p.kill()
+        except UnboundLocalError:
+            # this means that p was undefined at the moment of the keyboard interrupt
+            # (and we do nothing)
+            pass
+
+        raise KeyboardInterrupt
 
 def array_to_binary_file(data, output_file_name):
+
     data = numpy.array(data, 'float32')
-    fid = open(output_file_name, 'wb')
-    data.tofile(fid)
-    fid.close()
+    #fid = open(output_file_name, 'wb')
+    print("DEBUG: data", data.shape)
+    print("output_file_name:", output_file_name)
+
+    data.tofile(output_file_name)
+    #fid.close()
 
 
 def load_binary_file_frame(file_name, dimension):
@@ -135,13 +201,13 @@ def load_binary_file_frame(file_name, dimension):
     fid_lab.close()
     assert features.size % float(dimension) == 0.0,'specified dimension %s not compatible with data'%(dimension)
     frame_number = features.size / dimension
-    features = features[:(dimension * frame_number)]
+    features = features[:(int(dimension * frame_number))]
     features = features.reshape((-1, dimension))
     return features, frame_number
 
 
 def generate_merlin_wav(
-        data, gen_dir, file_basename, norm_info_file,
+        acoustic_feat, gen_dir, file_basename, norm_info_file,
         do_post_filtering=True, mgc_dim=60, fl=1024, sr=16000):
     # Made from Jose's code and Merlin
     gen_dir = os.path.abspath(gen_dir) + "/"
@@ -160,9 +226,10 @@ def generate_merlin_wav(
     cmp_mean = cmp_info[0, ]
     cmp_std = cmp_info[1, ]
 
-    data = data * cmp_std + cmp_mean
-
-    array_to_binary_file(data, file_name)
+    #denormalisation
+    acoustic_feat = acoustic_feat * cmp_std + cmp_mean
+    
+    array_to_binary_file(acoustic_feat, file_name)
     # This code was adapted from Merlin. All licenses apply
 
     out_dimension_dict = {'bap': 1, 'lf0': 1, 'mgc': 60, 'vuv': 1}
@@ -182,7 +249,9 @@ def generate_merlin_wav(
     features, frame_number = load_binary_file_frame(file_name, 63)
 
     for feature_name in gen_wav_features:
-
+        print("feature: ", feature_name, str(stream_start_index[feature_name]), str(stream_start_index[feature_name] +
+            out_dimension_dict[feature_name]))
+        
         current_features = features[
             :, stream_start_index[feature_name]:
             stream_start_index[feature_name] +
@@ -195,15 +264,16 @@ def generate_merlin_wav(
                 vuv_feature = features[
                     :, stream_start_index['vuv']:stream_start_index['vuv'] + 1]
 
-                for i in range(frame_number):
+                for i in range(int(frame_number)):
                     if vuv_feature[i, 0] < 0.5:
                         gen_features[i, 0] = -1.0e+10  # self.inf_float
 
         new_file_name = os.path.join(
             dir_name, file_id + file_extension_dict[feature_name])
-
+      
         array_to_binary_file(gen_features, new_file_name)
 
+    print("DEBUG: feature writing is done.")
     pf_coef = 1.4
     fw_alpha = 0.58
     co_coef = 511
@@ -250,13 +320,13 @@ def generate_merlin_wav(
         for i in range(2, mgc_dim):
             line = line + str(pf_coef) + " "
 
-        pe(
+        run_process(
             '{line} | {x2x} +af > {weight}'
             .format(
                 line=line, x2x=sptk_path['X2X'],
                 weight=os.path.join(gen_dir, 'weight')), shell=True)
 
-        pe(
+        run_process(
             '{freqt} -m {order} -a {fw} -M {co} -A 0 < {mgc} | '
             '{c2acr} -m {co} -M 0 -l {fl} > {base_r0}'
             .format(
@@ -265,7 +335,7 @@ def generate_merlin_wav(
                 c2acr=sptk_path['C2ACR'], fl=fl_coef,
                 base_r0=files['mgc'] + '_r0'), shell=True)
 
-        pe(
+        run_process(
             '{vopr} -m -n {order} < {mgc} {weight} | '
             '{freqt} -m {order} -a {fw} -M {co} -A 0 | '
             '{c2acr} -m {co} -M 0 -l {fl} > {base_p_r0}'
@@ -277,7 +347,7 @@ def generate_merlin_wav(
                 c2acr=sptk_path['C2ACR'], fl=fl_coef,
                 base_p_r0=files['mgc'] + '_p_r0'), shell=True)
 
-        pe(
+        run_process(
             '{vopr} -m -n {order} < {mgc} {weight} | '
             '{mc2b} -m {order} -a {fw} | '
             '{bcp} -n {order} -s 0 -e 0 > {base_b0}'
@@ -288,7 +358,7 @@ def generate_merlin_wav(
                 mc2b=sptk_path['MC2B'], fw=fw_coef,
                 bcp=sptk_path['BCP'], base_b0=files['mgc'] + '_b0'), shell=True)
 
-        pe(
+        run_process(
             '{vopr} -d < {base_r0} {base_p_r0} | '
             '{sopr} -LN -d 2 | {vopr} -a {base_b0} > {base_p_b0}'
             .format(
@@ -299,7 +369,7 @@ def generate_merlin_wav(
                 base_b0=files['mgc'] + '_b0',
                 base_p_b0=files['mgc'] + '_p_b0'), shell=True)
 
-        pe(
+        run_process(
             '{vopr} -m -n {order} < {mgc} {weight} | '
             '{mc2b} -m {order} -a {fw} | '
             '{bcp} -n {order} -s 1 -e {order} | '
@@ -320,19 +390,19 @@ def generate_merlin_wav(
 
     # Vocoder WORLD
 
-    pe(
+    run_process(
         '{sopr} -magic -1.0E+10 -EXP -MAGIC 0.0 {lf0} | '
         '{x2x} +fd > {f0}'
         .format(
             sopr=sptk_path['SOPR'], lf0=files['lf0'],
             x2x=sptk_path['X2X'], f0=files['f0']), shell=True)
 
-    pe(
+    run_process(
         '{sopr} -c 0 {bap} | {x2x} +fd > {ap}'.format(
             sopr=sptk_path['SOPR'], bap=files['bap'],
             x2x=sptk_path['X2X'], ap=files['ap']), shell=True)
 
-    pe(
+    run_process(
         '{mgc2sp} -a {alpha} -g 0 -m {order} -l {fl} -o 2 {mgc} | '
         '{sopr} -d 32768.0 -P | {x2x} +fd > {sp}'.format(
             mgc2sp=sptk_path['MGC2SP'], alpha=fw_alpha,
@@ -340,18 +410,19 @@ def generate_merlin_wav(
             sopr=sptk_path['SOPR'], x2x=sptk_path['X2X'], sp=files['sp']),
         shell=True)
 
-    pe(
+    run_process(
         '{synworld} {fl} {sr} {f0} {sp} {ap} {wav}'.format(
             synworld=world_path['SYNTHESIS'], fl=fl, sr=sr,
             f0=files['f0'], sp=files['sp'], ap=files['ap'],
             wav=files['wav']),
         shell=True)
-
-    pe(
+    '''
+    run_process(
         'rm -f {ap} {sp} {f0} {bap} {lf0} {mgc} {mgc}_b0 {mgc}_p_b0 '
         '{mgc}_p_mgc {mgc}_p_r0 {mgc}_r0 {cmp} weight'.format(
             ap=files['ap'], sp=files['sp'], f0=files['f0'],
             bap=files['bap'], lf0=files['lf0'], mgc=files['mgc'],
             cmp=base + '.cmp'),
         shell=True)
+    '''
     os.chdir(cur_dir)

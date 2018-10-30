@@ -168,7 +168,12 @@ class TBPTTIter(object):
         assert len(self.tgtLenths) == len(self.tgtBatch)
 
     def split_length(self, seq_size, batch_seq_len):
-        seq = [self.seq_len] * (seq_size / self.seq_len)
+
+        seq_size = seq_size.data.numpy()
+        #print("DEBUG: self.seq_len", self.seq_len)
+        #print("DEBUG: seq_size", seq_size)
+
+        seq = [self.seq_len] * int(seq_size / self.seq_len)
         if seq_size % self.seq_len != 0:
             seq += [seq_size % self.seq_len]
         seq += [0] * (batch_seq_len - len(seq))

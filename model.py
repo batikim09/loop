@@ -12,9 +12,9 @@ from torch.nn.utils.rnn import pack_padded_sequence as pack
 
 
 def getLinear(dim_in, dim_out):
-    return nn.Sequential(nn.Linear(dim_in, dim_in/10),
+    return nn.Sequential(nn.Linear(dim_in, int(dim_in/10)),
                          nn.ReLU(),
-                         nn.Linear(dim_in/10, dim_out))
+                         nn.Linear(int(dim_in/10), dim_out))
 
 
 class MaskedMSE(nn.Module):
@@ -67,11 +67,11 @@ class Encoder(nn.Module):
         if isinstance(input, tuple):
             outputs = unpack(outputs)[0]
 
-        ident = self.lut_s(speakers)
-        if ident.dim() == 3:
-            ident = ident.squeeze(1)
+        spk_ident = self.lut_s(speakers)
+        if spk_ident.dim() == 3:
+            spk_ident = spk_ident.squeeze(1)
 
-        return outputs, ident
+        return outputs, spk_ident
 
 
 class GravesAttention(nn.Module):
@@ -83,12 +83,12 @@ class GravesAttention(nn.Module):
         self.attention_alignment = attention_alignment
         self.epsilon = 1e-5
 
-        self.sm = nn.Softmax()
+        self.sm = nn.Softmax(dim=-1)
         self.N_a = getLinear(mem_elem, 3*K)
         self.J = Variable(torch.arange(0, 500)
                                .expand_as(torch.Tensor(batch_size,
                                           self.K,
-                                          500)),
+                                          500)).float(),
                           requires_grad=False)
 
     def forward(self, C, context, mu_tm1):
@@ -115,8 +115,13 @@ class GravesAttention(nn.Module):
         # attention weights
         phi_t = g_t * torch.exp(-0.5 * sig_t * (mu_t_ - j)**2)
         alpha_t = self.COEF * torch.sum(phi_t, 1)
+        
+        alpha_t = alpha_t.view(-1, 1, alpha_t.size(1))
 
+        #print("DEBUG: alpha_t (bx1xl),", alpha_t.size())
+        #print("DEBUG: context (bxlxdp),", context.size())
         c_t = torch.bmm(alpha_t, context).transpose(0, 1).squeeze(0)
+        #print("DEBUG: c_t (bxdp),", c_t.size())
         return c_t, mu_t, alpha_t
 
 
@@ -143,30 +148,35 @@ class Decoder(nn.Module):
         self.F_u = nn.Linear(self.hidden_size,  self.hidden_size)
         self.F_o = nn.Linear(self.hidden_size,  self.hidden_size)
 
-    def init_buffer(self, ident, start=True):
+    def init_buffer(self, spk_ident, start=True):
         mem_feat_size = self.hidden_size + self.output_size
-        batch_size = ident.size(0)
+        batch_size = spk_ident.size(0)
 
         if start:
-            self.mu_t = Variable(ident.data.new(batch_size, self.K).zero_())
-            self.S_t = Variable(ident.data.new(batch_size,
+            self.mu_t = Variable(spk_ident.data.new(batch_size, self.K).zero_())
+            self.S_t = Variable(spk_ident.data.new(batch_size,
                                                mem_feat_size,
                                                self.mem_size).zero_())
 
-            # initialize with identity
-            self.S_t[:, :self.hidden_size, :] = ident.unsqueeze(2) \
-                                                     .expand(ident.size(0),
-                                                             ident.size(1),
+            # initialize with spk_identity
+            self.S_t[:, :self.hidden_size, :] = spk_ident.unsqueeze(2) \
+                                                     .expand(spk_ident.size(0),
+                                                             spk_ident.size(1),
                                                              self.mem_size)
         else:
             self.mu_t = self.mu_t.detach()
             self.S_t = self.S_t.detach()
 
-    def update_buffer(self, S_tm1, c_t, o_tm1, ident):
+    def update_buffer(self, S_tm1, c_t, o_tm1, spk_ident, scaling_output=30):
         # concat previous output & context
-        idt = torch.tanh(self.F_u(ident))
+        idt = torch.tanh(self.F_u(spk_ident))
         o_tm1 = o_tm1.squeeze(0)
-        z_t = torch.cat([c_t + idt, o_tm1/30], 1)
+
+        #print("DEBUG: c_t (bxdp):", c_t.size())
+        #print("DEBUG: idt (bxdp):", idt.size())
+        #print("DEBUG: o_tm1 (bxdo):", o_tm1.size())
+
+        z_t = torch.cat([c_t + idt, o_tm1/scaling_output], 1)
         z_t = z_t.unsqueeze(2)
         Sp = torch.cat([z_t, S_tm1[:, :, :-1]], 2)
 
@@ -178,10 +188,10 @@ class Decoder(nn.Module):
 
         return S
 
-    def forward(self, x, ident, context, start=True):
+    def forward(self, x, spk_ident, context, start=True):
         out, attns = [], []
         o_t = x[0]
-        self.init_buffer(ident, start)
+        self.init_buffer(spk_ident, start)
 
         for o_tm1 in torch.split(x, 1):
             if not self.training:
@@ -193,12 +203,12 @@ class Decoder(nn.Module):
                                            self.mu_t)
 
             # advance mu and update buffer
-            self.S_t = self.update_buffer(self.S_t, c_t, o_tm1, ident)
+            self.S_t = self.update_buffer(self.S_t, c_t, o_tm1, spk_ident)
             self.mu_t = mu_t
 
             # predict next time step based on buffer content
             ot_out = self.N_o(self.S_t.view(self.S_t.size(0), -1))
-            sp_out = self.F_o(ident)
+            sp_out = self.F_o(spk_ident)
             o_t = self.output(ot_out + sp_out)
 
             out += [o_t]
@@ -244,7 +254,7 @@ class Loop(nn.Module):
     def forward(self, src, tgt, start=True):
         x = self.init_input(tgt, start)
 
-        context, ident = self.encoder(src[0], src[1])
-        out, attn = self.decoder(x, ident, context, start)
+        context, spk_ident = self.encoder(src[0], src[1])
+        out, attn = self.decoder(x, spk_ident, context, start)
 
         return out, attn

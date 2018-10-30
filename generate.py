@@ -63,6 +63,7 @@ def trim_pred(out, attn):
 
 
 def npy_loader_phonemes(path):
+    print("DEBUG: path:", path)
     feat = np.load(path)
 
     txt = feat['phonemes'].astype('int64')
@@ -88,6 +89,7 @@ def main():
                  't': 34, 'th': 35, 'uh': 36, 'uw': 37, 'v': 38, 'w': 39, 'y': 40,
                  'z': 41}
     nspkr = train_args.nspk
+    print(train_args)
 
     norm_path = None
     if os.path.exists(train_args.data + '/norm_info/norm.dat'):
@@ -101,6 +103,8 @@ def main():
 
     model = Loop(train_args)
     model.load_state_dict(weights)
+    print(model)
+
     if args.gpu >= 0:
         model.cuda()
     model.eval()
@@ -109,23 +113,23 @@ def main():
         print('ERROR: Unknown speaker id: %d.' % args.spkr)
         return
 
-    txt, feat, spkr, output_fname = None, None, None, None
+    txt, acoustic_feat, spkr, output_fname = None, None, None, None
     if args.npz is not '':
-        txt, feat = npy_loader_phonemes(args.npz)
+        txt, acoustic_feat = npy_loader_phonemes(args.npz)
 
         txt = Variable(txt.unsqueeze(1), volatile=True)
-        feat = Variable(feat.unsqueeze(1), volatile=True)
+        acoustic_feat = Variable(acoustic_feat.unsqueeze(1), volatile=True)
         spkr = Variable(torch.LongTensor([args.spkr]), volatile=True)
 
         fname = os.path.basename(args.npz)[:-4]
         output_fname = fname + '.gen_' + str(args.spkr)
     elif args.text is not '':
         txt = text2phone(args.text, char2code)
-        feat = torch.FloatTensor(txt.size(0)*20, 63)
+        acoustic_feat = torch.FloatTensor(txt.size(0)*20, 63)
         spkr = torch.LongTensor([args.spkr])
 
         txt = Variable(txt.unsqueeze(1), volatile=True)
-        feat = Variable(feat.unsqueeze(1), volatile=True)
+        acoustic_feat = Variable(acoustic_feat.unsqueeze(1), volatile=True)
         spkr = Variable(spkr, volatile=True)
 
         # slugify input string to file name
@@ -140,11 +144,11 @@ def main():
 
     if args.gpu >= 0:
         txt = txt.cuda()
-        feat = feat.cuda()
+        acoustic_feat = acoustic_feat.cuda()
         spkr = spkr.cuda()
 
 
-    out, attn = model([txt, spkr], feat)
+    out, attn = model([txt, spkr], acoustic_feat)
     out, attn = trim_pred(out, attn)
 
     output_dir = os.path.join(os.path.dirname(args.checkpoint), 'results')
@@ -158,10 +162,10 @@ def main():
 
     if args.npz is not '':
         output_orig_fname = os.path.basename(args.npz)[:-4] + '.orig'
-        generate_merlin_wav(feat[:, 0, :].data.cpu().numpy(),
+        generate_merlin_wav(acoustic_feat[:, 0, :].data.cpu().numpy(),
                             output_dir,
                             output_orig_fname,
-                            norm_path)
+                            norm_path, False)
 
 
 if __name__ == '__main__':

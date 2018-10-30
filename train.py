@@ -116,6 +116,8 @@ def train(model, criterion, optimizer, epoch, train_losses):
 
             # Forward
             output, _ = model([input, spkr], target[0], start)
+
+            # input, target, length for loss calculation
             loss = criterion(output, target[0], target[1])
 
             # Backward
@@ -127,7 +129,7 @@ def train(model, criterion, optimizer, epoch, train_losses):
             optimizer.step()
 
             # Keep track of loss
-            batch_total += loss.data[0]
+            batch_total += float(loss.data.item())
 
         batch_total = batch_total/len(batch_iter)
         total += batch_total
